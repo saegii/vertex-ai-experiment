@@ -1,0 +1,169 @@
+# PIPELINE DEFINITION
+# Name: rag-ingest
+# Inputs:
+#    chunk_size: int [Default: 500.0]
+#    gcs_uri: str
+#    index_resource_name: str
+components:
+  comp-chunk-documents:
+    executorLabel: exec-chunk-documents
+    inputDefinitions:
+      parameters:
+        chunk_size:
+          parameterType: NUMBER_INTEGER
+        gcs_uri:
+          parameterType: STRING
+    outputDefinitions:
+      artifacts:
+        chunks_out:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+  comp-embed-and-index:
+    executorLabel: exec-embed-and-index
+    inputDefinitions:
+      artifacts:
+        chunks_in:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+      parameters:
+        index_resource_name:
+          parameterType: STRING
+    outputDefinitions:
+      artifacts:
+        embeddings_out:
+          artifactType:
+            schemaTitle: system.Artifact
+            schemaVersion: 0.0.1
+defaultPipelineRoot: gs://experiment-b77ffdf0-1101-44eb-8d3c-3375c185554d/pipeline_root
+deploymentSpec:
+  executors:
+    exec-chunk-documents:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - chunk_documents
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'google-cloud-aiplatform'\
+          \ 'pypdf'  &&  python3 -m pip install --quiet --no-warn-script-location\
+          \ 'kfp==2.15.2' '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"\
+          3.9\"' && \"$0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef chunk_documents(\n    gcs_uri: str,\n    chunk_size: int,\n \
+          \   chunks_out: Output[Dataset]\n):\n    import json, pypdf, re\n    from\
+          \ google.cloud import storage\n\n    # Download from GCS\n    bucket_name\
+          \ = gcs_uri.replace(\"gs://\", \"\").split(\"/\")[0]\n    blob_path = \"\
+          /\".join(gcs_uri.replace(\"gs://\", \"\").split(\"/\")[1:])\n    client\
+          \ = storage.Client()\n    blob = client.bucket(bucket_name).blob(blob_path)\n\
+          \    blob.download_to_filename(\"/experiment-files/cars.txt\")\n\n    #\
+          \ Chunk\n    # reader = pypdf.PdfReader(\"/tmp/doc.pdf\")\n    # full_text\
+          \ = \"\\n\".join(p.extract_text() for p in reader.pages)\n    full_text\
+          \ = blob.download_as_text()\n    chunks = [full_text[i:i+chunk_size] for\
+          \ i in range(0, len(full_text), chunk_size - 50)]\n\n    with open(chunks_out.path,\
+          \ \"w\") as f:\n        json.dump(chunks, f)\n\n"
+        image: python:3.10
+    exec-embed-and-index:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - embed_and_index
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'google-cloud-aiplatform'\
+          \  &&  python3 -m pip install --quiet --no-warn-script-location 'kfp==2.15.2'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"' && \"\
+          $0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef embed_and_index(\n    chunks_in: Input[Dataset],\n    index_resource_name:\
+          \ str,\n    embeddings_out: Output[Artifact]\n):\n    import json\n    from\
+          \ google.cloud import aiplatform\n    from vertexai.language_models import\
+          \ TextEmbeddingModel\n\n    with open(chunks_in.path) as f:\n        chunks\
+          \ = json.load(f)\n\n    model = TextEmbeddingModel.from_pretrained(\"text-embedding-005\"\
+          )\n    embeddings = model.get_embeddings(chunks)\n    vectors = [e.values\
+          \ for e in embeddings]\n\n    # Upsert to Vector Search\n    index = aiplatform.MatchingEngineIndex(index_resource_name)\n\
+          \    index.upsert_datapoints(datapoints=[\n        {\"datapoint_id\": f\"\
+          chunk_{i}\", \"feature_vector\": vec}\n        for i, vec in enumerate(vectors)\n\
+          \    ])\n\n    # Save chunk text mapping to GCS artifact\n    data = {f\"\
+          chunk_{i}\": text for i, text in enumerate(chunks)}\n    with open(embeddings_out.path,\
+          \ \"w\") as f:\n        json.dump(data, f)\n\n"
+        image: python:3.10
+pipelineInfo:
+  name: rag-ingest
+root:
+  dag:
+    tasks:
+      chunk-documents:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-chunk-documents
+        inputs:
+          parameters:
+            chunk_size:
+              componentInputParameter: chunk_size
+            gcs_uri:
+              componentInputParameter: gcs_uri
+        taskInfo:
+          name: chunk-documents
+      embed-and-index:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-embed-and-index
+        dependentTasks:
+        - chunk-documents
+        inputs:
+          artifacts:
+            chunks_in:
+              taskOutputArtifact:
+                outputArtifactKey: chunks_out
+                producerTask: chunk-documents
+          parameters:
+            index_resource_name:
+              componentInputParameter: index_resource_name
+        taskInfo:
+          name: embed-and-index
+  inputDefinitions:
+    parameters:
+      chunk_size:
+        defaultValue: 500.0
+        isOptional: true
+        parameterType: NUMBER_INTEGER
+      gcs_uri:
+        parameterType: STRING
+      index_resource_name:
+        parameterType: STRING
+schemaVersion: 2.1.0
+sdkVersion: kfp-2.15.2
